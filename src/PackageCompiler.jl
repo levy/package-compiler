@@ -13,6 +13,28 @@ using TOML
 using Glob
 using p7zip_jll: p7zip_path
 
+"""
+    @phase name expression
+
+Time one phase of a build and print what it cost, when `PACKAGECOMPILER_TIMING`
+is set. A build is several phases with very different costs, and a wall-clock
+total says nothing about which one to attack.
+"""
+macro phase(name, expression)
+    quote
+        if get(ENV, "PACKAGECOMPILER_TIMING", "0") == "0"
+            $(esc(expression))
+        else
+            local t0 = time()
+            local result = $(esc(expression))
+            println("PHASE ", $(esc(name)), " ", round(time() - t0; digits = 1), " s")
+            flush(stdout)
+            result
+        end
+    end
+end
+
+
 export create_sysimage, create_app, create_library
 
 include("juliaconfig.jl")
@@ -470,8 +492,21 @@ end
 
 function ensurecompiled(project, packages, sysimage)
     length(packages) == 0 && return
-    # TODO: Only precompile `packages` (should be available in Pkg 1.8)
-    cmd = `$(get_julia_cmd()) --sysimage=$sysimage -e 'using Pkg; Pkg.precompile()'`
+    # Load the packages, rather than asking Pkg to precompile them.
+    #
+    # The job here is to leave a cache that the sysimage build can read. That
+    # build runs under `--pkgimages=no`, so it needs the source-only cache, and
+    # `import` writes exactly that one — a package whose cache is missing or
+    # stale precompiles as it loads.
+    #
+    # `Pkg.precompile()` did the same job and cost 45 to 80 seconds of every
+    # build, on a project with no dependencies at all. Under `--pkgimages=no` its
+    # staleness scan rejects every pkgimage-backed cache in the depot, so what it
+    # costs follows the size of the depot rather than the size of the project:
+    # measured on one holding 15,324 files, 0.45 s with pkgimages against 45.6 s
+    # without, for a call that precompiled nothing and printed nothing.
+    imports = join(("import " * String(package) for package in packages), "\n")
+    cmd = `$(get_julia_cmd()) --sysimage=$sysimage -e $imports`
     splitter = Sys.iswindows() ? ';' : ':'
     @debug "ensurecompiled: running $cmd" JULIA_LOAD_PATH = "$project$(splitter)@stdlib"
     cmd = addenv(cmd, "JULIA_LOAD_PATH" => "$project$(splitter)@stdlib")
@@ -784,7 +819,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
         base_sysimage = something(base_sysimage, unsafe_string(Base.JLOptions().image_file))
     end
 
-    ensurecompiled(project, packages, base_sysimage)
+    @phase "ensurecompiled" ensurecompiled(project, packages, base_sysimage)
 
     # Requested packages must always be loaded into the sysimage. The option only
     # controls whether their dependency graph is loaded explicitly as well.
@@ -803,7 +838,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
     # PR: https://github.com/JuliaLang/PackageCompiler.jl/pull/930
     object_files = [object_file]
     try
-        create_sysimg_object_file(object_file, packages, packages_sysimg;
+        @phase "emit-object" create_sysimg_object_file(object_file, packages, packages_sysimg;
                                 project,
                                 base_sysimage,
                                 precompile_execution_file,
@@ -833,7 +868,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                 end
             end
         end
-        create_sysimg_from_object_file(object_files,
+        @phase "link-sysimage" create_sysimg_from_object_file(object_files,
                                     sysimage_path;
                                     compat_level,
                                     version,
@@ -1032,23 +1067,25 @@ function create_app(package_dir::String,
 
     ctx = create_pkg_context(package_dir)
     ctx.env.pkg === nothing && error("expected package to have a `name` and `uuid`")
-    Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
+    @phase "instantiate" Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
 
     if executables === nothing
         executables = [ctx.env.pkg.name => "julia_main"]
     end
-    try_rm_dir(app_dir; force)
+    @phase "remove-output" try_rm_dir(app_dir; force)
     stdlibs = gather_stdlibs_project(ctx)
     if !filter_stdlibs
         stdlibs = unique(vcat(stdlibs, map(pkg -> pkg.name, stdlibs_in_default_sysimage())))
     end
-    library_info = bundle_julia_libraries(app_dir, stdlibs; quiet)
-    artifact_info = bundle_artifacts(ctx, app_dir; include_lazy_artifacts, quiet)
-    bundle_julia_libexec(ctx, app_dir)
-    bundle_julia_executable(app_dir)
-    bundle_project(ctx, app_dir)
-    include_preferences && bundle_preferences(ctx, app_dir)
-    bundle_cert(app_dir)
+    library_info = @phase "bundle-libraries" bundle_julia_libraries(app_dir, stdlibs; quiet)
+    artifact_info = @phase "bundle-artifacts" bundle_artifacts(ctx, app_dir; include_lazy_artifacts, quiet)
+    @phase "bundle-rest" begin
+        bundle_julia_libexec(ctx, app_dir)
+        bundle_julia_executable(app_dir)
+        bundle_project(ctx, app_dir)
+        include_preferences && bundle_preferences(ctx, app_dir)
+        bundle_cert(app_dir)
+    end
     quiet || print_bundle_info(library_info, artifact_info)
 
     # Sysimage always goes in lib/julia/ (this is hardcoded in the Julia binary)
@@ -1067,7 +1104,7 @@ function create_app(package_dir::String,
     push!(precompiles, "precompile(Tuple{typeof(empty!), Vector{String}})")
     push!(precompiles, "precompile(Tuple{typeof(popfirst!), Vector{String}})")
 
-    create_sysimage([package_name]; sysimage_path, project,
+    @phase "create-sysimage" create_sysimage([package_name]; sysimage_path, project,
                     incremental,
                     filter_stdlibs,
                     precompile_execution_file,
@@ -1079,7 +1116,7 @@ function create_app(package_dir::String,
                     extra_precompiles = join(precompiles, "\n"),
                     script)
 
-    for (app_name, julia_main) in executables
+    @phase "launcher" for (app_name, julia_main) in executables
         create_executable_from_sysimg(joinpath(app_dir, "bin", app_name), c_driver_program, string(package_name, ".", julia_main))
     end
 end
