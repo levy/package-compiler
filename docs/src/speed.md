@@ -4,17 +4,18 @@ A build spends nearly all of its wall clock in one place: the Julia child proces
 that writes the system image. This page says what that process does, which part
 of it can use more than one CPU, and which settings change the time.
 
-The numbers below come from `examples/MyApp` on a machine with 32 CPUs. The
-build ran in a lane of 8 CPUs.
+The shares below come from `examples/MyApp` on a machine with 32 CPUs, in a lane
+of 8 CPUs. Read them as shares and not as times: the wall clock of a build moves
+by a factor of two or three with the other work on the machine.
 
-| Phase | Time | Share |
-| --- | --- | --- |
-| copy the libraries, the artifacts and the other files | 8 s | 1.6% |
-| build the fresh base system image | 0 s from the cache | — |
-| `Pkg.precompile` on the base system image | 113 s | 22% |
-| run the precompile execution file | 41 s | 8% |
-| compile the system image | 343 s | 67% |
-| link the system image and build the executable | 3 s | 0.6% |
+| Phase | Share |
+| --- | --- |
+| copy the libraries, the artifacts and the other files | about 2% |
+| build the fresh base system image | 0, when the cache answers |
+| `Pkg.precompile` on the base system image | about 20% |
+| run the precompile execution file | about 8% |
+| compile the system image | about 70% |
+| link the system image and build the executable | under 1% |
 
 ## Choose the processor target
 
@@ -24,11 +25,12 @@ machine that builds. This is the fast choice. Julia compiles each function once.
 An app that you send to a machine that you do not know needs more. Pass
 `cpu_target = PackageCompiler.portable_app_cpu_target()`. That target names three
 processors and `clone_all`, so Julia compiles every function three times. The
-cost is large and it is serial: on the machine above, one step of a multi-target
-build ran for 401 seconds and used 400 seconds of CPU, which is one core. The
-system image grew from 165 MB to 225 MB.
+cost is large and it is serial. On the machine above, one step of a multi-target
+build ran for over six minutes on a single core, and the base system image grew
+from 165 MB to 225 MB.
 
-Build native unless you ship the app.
+This is the largest single choice on this page. Build native unless you ship the
+app.
 
 ## The base system image comes from a cache
 
@@ -71,9 +73,11 @@ never reads that number when it writes an image.
 
 The first half of a system-image build infers types. Julia infers under one
 global lock, and its own build script warns that more than one thread causes a
-build error. That half runs on one core, and no setting changes this. The
-measured phase used 692 seconds of CPU in 316 seconds of wall clock, an average
-of 2.18 cores: a serial front, then a parallel tail.
+build error. That half runs on one core, and no setting changes this. A measured
+phase used 692 seconds of CPU in 316 seconds of wall clock, an average of about
+two cores: a serial front, then a parallel tail. More threads shorten the tail
+only, so the gain from `JULIA_IMAGE_THREADS` is real but small beside the cost of
+the front.
 
 Therefore the way to a faster build is to give the compiler less to do:
 
