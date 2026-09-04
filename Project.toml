@@ -6,6 +6,7 @@ version = "2.4.1"
 projects = ["test/subproject"]
 
 [deps]
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Artifacts = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 Glob = "c27321d9-0574-5035-807b-f59d2c89b15c"
 LazyArtifacts = "4af54fe1-eca0-43a8-85a7-787d91b784e3"
