@@ -19,6 +19,10 @@ using p7zip_jll: p7zip_path
 Time one phase of a build and print what it cost, when `PACKAGECOMPILER_TIMING`
 is set. A build is several phases with very different costs, and a wall-clock
 total says nothing about which one to attack.
+
+**A phase that runs beside another one is not timed.** `create_app` copies the
+files of the app on a spawned task while the system image compiles, so timing
+each copy would report wall clock that the build never spent.
 """
 macro phase(name, expression)
     quote
@@ -59,8 +63,21 @@ const DEFAULT_JULIA_INIT_HEADER = @path joinpath(@__DIR__, "julia_init.h")
 default_julia_init() = String(DEFAULT_JULIA_INIT)
 default_julia_init_header() = String(DEFAULT_JULIA_INIT_HEADER)
 
+"""
+    portable_app_cpu_target() -> String
+
+The processor target of an app that must run on another machine.
+
+The target names more than one processor, and `clone_all` tells Julia to compile
+every function once for each of them. The app then runs on an old processor and
+still uses the instructions of a new one. The build pays for this: it compiles
+the same code two or three times, and that work is serial.
+
+Pass this as `cpu_target` to `create_app` when you ship the app to a machine that
+you do not know.
+"""
 # See https://github.com/JuliaCI/julia-buildbot/blob/489ad6dee5f1e8f2ad341397dc15bb4fce436b26/master/inventory.py
-function default_app_cpu_target()
+function portable_app_cpu_target()
     Sys.ARCH === :i686        ?  "pentium4;sandybridge,-xsaveopt,clone_all"                        :
     Sys.ARCH === :x86_64      ?  "generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1)"  :
     Sys.ARCH === :arm         ?  "armv7-a;armv7-a,neon;armv7-a,neon,vfp4"                          :
@@ -68,6 +85,22 @@ function default_app_cpu_target()
     Sys.ARCH === :powerpc64le ?  "pwr8"                                                            :
         "generic"
 end
+
+"""
+    default_app_cpu_target() -> String
+
+The processor target that `create_app` and `create_library` use.
+
+The target is `native`: compile for the processor of this machine only. This is
+the fast choice, because the build compiles each function once. A multi-target
+build compiles it two or three times, and that work is serial, so it dominates
+the wall clock.
+
+The app then needs a processor like the one that built it. For an app that you
+ship to a machine that you do not know, pass
+`cpu_target = portable_app_cpu_target()`.
+"""
+default_app_cpu_target() = "native"
 
 function bitflag()
     Sys.ARCH === :i686   ? `-m32` :
@@ -82,6 +115,100 @@ function march()
     Sys.ARCH === :aarch64     ? `-march=armv8-a+crypto+simd` :
     Sys.ARCH === :powerpc64le ? ``                           :
         ``
+end
+
+
+###############
+# Parallelism #
+###############
+
+"""
+    build_jobs() -> Int
+
+How many independent build steps run at the same time.
+
+`PACKAGECOMPILER_JOBS` sets the number. Without it the number is the count that
+Julia itself uses, `jl_effective_threads`. That count follows the CPU affinity of
+the process, so a build under `taskset` asks for the CPUs it may use and not for
+every CPU of the machine. `JULIA_CPU_THREADS` caps it, as it caps the thread
+counts of Julia. The count is never less than 1.
+"""
+function build_jobs()
+    n = tryparse(Int, get(ENV, "PACKAGECOMPILER_JOBS", ""))
+    if n === nothing
+        available = try
+            Int(ccall(:jl_effective_threads, Cint, ()))
+        catch
+            Sys.CPU_THREADS
+        end
+        cap = tryparse(Int, get(ENV, "JULIA_CPU_THREADS", ""))
+        n = cap === nothing ? available : min(available, cap)
+    end
+    return max(n, 1)
+end
+
+"""
+    with_image_threads(cmd::Cmd) -> Cmd
+
+Give a system-image build every CPU for the part that writes the object file.
+
+Julia writes that object file on more than one thread, but it asks for only
+`jl_effective_threads() / 2` of them: half of the CPUs. `JULIA_IMAGE_THREADS`
+sets the number instead. This is the one setting that adds cores to a
+system-image build. The front half of such a build infers types, and Julia infers
+under one global lock, so no setting makes that half faster.
+
+A number that the caller already set stays as it is.
+"""
+function with_image_threads(cmd::Cmd)
+    haskey(ENV, "JULIA_IMAGE_THREADS") && return cmd
+    return addenv(cmd, "JULIA_IMAGE_THREADS" => string(build_jobs()))
+end
+
+"""
+    run_in_parallel(f, items; jobs = build_jobs()) -> Vector
+
+Apply `f` to each item and answer the results in the order of `items`.
+
+At most `jobs` items are in flight. Use this for a step that spends its time in a
+child process: the child runs on its own core, so the parent needs no extra
+thread. A step that burns CPU in the parent gains only when the user starts Julia
+with `--threads`.
+
+If an item fails, this throws the error of that item, not the wrapper that
+`@sync` builds. A compiler error then reads the same as it did before.
+"""
+function run_in_parallel(f, items; jobs::Int = build_jobs())
+    n = length(items)
+    if n <= 1 || jobs <= 1
+        return Any[f(item) for item in items]
+    end
+    results = Vector{Any}(undef, n)
+    limit = Base.Semaphore(min(jobs, n))
+    try
+        @sync for (i, item) in enumerate(items)
+            Base.acquire(limit)
+            Threads.@spawn try
+                results[i] = f(item)
+            finally
+                Base.release(limit)
+            end
+        end
+    catch e
+        throw(first_cause(e))
+    end
+    return results
+end
+
+"""
+    first_cause(e) -> Exception
+
+Dig the first real error out of the wrappers that `@sync` and a task put around it.
+"""
+function first_cause(e)
+    e isa CompositeException && !isempty(e.exceptions) && return first_cause(first(e.exceptions))
+    e isa TaskFailedException && return first_cause(e.task.result)
+    return e
 end
 
 
@@ -396,19 +523,28 @@ end
 Build the fresh base sysimage, or answer the cached one.
 
 `cache = false` builds into a temporary directory, which is what this always did.
+
+Two builds can run at the same time and share the cache directory. Therefore the
+build always writes a private directory, and it publishes the finished file with
+a rename. A rename inside one filesystem is atomic, so a reader sees either the
+file that was there before or the whole new file, and never a part of one.
 """
 function create_fresh_base_sysimage(; cpu_target::String, sysimage_build_args::Cmd,
                                       cache::Bool = get(ENV, "PACKAGECOMPILER_CACHE_BASE", "1") != "0")
+    cached = nothing
     if cache
-        cached = joinpath(fresh_base_sysimage_cache(; cpu_target, sysimage_build_args),
-                          "sys." * Libdl.dlext)
+        cache_dir = fresh_base_sysimage_cache(; cpu_target, sysimage_build_args)
+        cached = joinpath(cache_dir, "sys." * Libdl.dlext)
         if isfile(cached)
             @debug "PackageCompiler: reusing the cached fresh base sysimage" cached
             return cached
         end
+        # Build inside the cache directory so that the rename below stays on one
+        # filesystem.
+        tmp = mktempdir(mkpath(cache_dir))
+    else
+        tmp = mktempdir()
     end
-    tmp = cache ? mkpath(fresh_base_sysimage_cache(; cpu_target, sysimage_build_args)) :
-          mktempdir()
     sysimg_source_path = Base.find_source_file("sysimg.jl")
     base_dir = dirname(sysimg_source_path)
     tmp_corecompiler_o = joinpath(tmp, "corecompiler-o.a")
@@ -437,13 +573,14 @@ function create_fresh_base_sysimage(; cpu_target::String, sysimage_build_args::C
     filter!(p -> !contains(p, "--compile") && p ∉ ("--strip-ir", "--strip-metadata"), sysimage_build_args_strs)
     sysimage_build_args = Cmd(sysimage_build_args_strs)
 
+    try
     cd(base_dir) do
         spinner = TerminalSpinners.Spinner(msg = "PackageCompiler: creating compiler sysimage (incremental=false)")
         TerminalSpinners.@spin spinner begin
             # Create corecompiler object file
-            cmd = `$(get_julia_cmd()) --cpu-target $cpu_target
+            cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target $cpu_target
                 --output-o $tmp_corecompiler_o $sysimage_build_args
-                $compiler_source_path $compiler_args`
+                $compiler_source_path $compiler_args`)
             @debug "running $cmd"
 
             read(cmd)
@@ -464,7 +601,7 @@ function create_fresh_base_sysimage(; cpu_target::String, sysimage_build_args::C
             new_sysimage_source_path = joinpath(tmp, "sysimage_packagecompiler_$(uuid1()).jl")
             write(new_sysimage_source_path, new_sysimage_content)
             try
-                cmd = addenv(`$(get_julia_cmd()) --cpu-target $cpu_target
+                cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target $cpu_target
                     --sysimage=$tmp_corecompiler_sl --threads=1
                     $sysimage_build_args --output-o=$tmp_sys_o
                     $new_sysimage_source_path $compiler_args`)
@@ -487,7 +624,18 @@ function create_fresh_base_sysimage(; cpu_target::String, sysimage_build_args::C
         end
     end
 
-    return tmp_sys_sl
+    catch
+        # The private directory sits inside the cache. Drop it, so that a build
+        # that fails does not leave rubbish in the cache for ever.
+        cached === nothing || rm(tmp; recursive=true, force=true)
+        rethrow()
+    end
+
+    cached === nothing && return tmp_sys_sl
+    # Publish the finished file into the cache and drop the private directory.
+    mv(tmp_sys_sl, cached; force=true)
+    rm(tmp; recursive=true, force=true)
+    return cached
 end
 
 function ensurecompiled(project, packages, sysimage)
@@ -562,13 +710,15 @@ function create_sysimg_object_file(object_file::String,
     end
 
     # Handle precompilation
-    precompile_files = String[]
     @debug "running precompilation execution script..."
     precompile_dir = mktempdir(; prefix="jl_packagecompiler_", cleanup=false)
-    for file in (isempty(precompile_execution_file) ? (nothing,) : precompile_execution_file)
-        tracefile = run_precompilation_script(project, base_sysimage, file, precompile_dir)
-        push!(precompile_files, tracefile)
-    end
+    # Each script runs in its own Julia process, so the scripts run at the same
+    # time. The output of two scripts then interleaves on the terminal.
+    scripts = isempty(precompile_execution_file) ? Union{String,Nothing}[nothing] :
+              Union{String,Nothing}[precompile_execution_file...]
+    precompile_files = String[run_in_parallel(scripts) do file
+        run_precompilation_script(project, base_sysimage, file, precompile_dir)
+    end...]
     append!(precompile_files, abspath.(precompile_statements_file))
     precompile_code = """
         # This @eval prevents symbols from being put into Main
@@ -683,9 +833,14 @@ function create_sysimg_object_file(object_file::String,
     # or provided via JULIA_NUM_THREADS.
     # This is needed until the underlying bug is fixed (see https://github.com/JuliaLang/PackageCompiler.jl/issues/963 and especially
     # https://github.com/JuliaLang/PackageCompiler.jl/issues/990 containing a `git bisect` to the commit introducing the problem)
-    cmd = `$(get_julia_cmd()) --cpu-target=$cpu_target $sysimage_build_args
+    #
+    # `--threads` is the count of runtime worker threads. It does not reach the
+    # code that writes the object file: `src/aotcompile.cpp` of Julia never reads
+    # `jl_options.nthreads`. `with_image_threads` sets the count that this code
+    # does read, so the pin above stays and the object file still uses every CPU.
+    cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$cpu_target $sysimage_build_args
         --sysimage=$base_sysimage --project=$project --output-o=$(object_file)
-        --threads=1 $outputo_file`
+        --threads=1 $outputo_file`)
     @debug "running $cmd"
 
     non = incremental ? "" : "non"
@@ -808,7 +963,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
     # Instantiate the project
 
     @debug "instantiating project at $(repr(project))"
-    Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
+    @phase "instantiate" Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
 
     if !incremental
         if base_sysimage !== nothing
@@ -868,7 +1023,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                 end
             end
         end
-        @phase "link-sysimage" create_sysimg_from_object_file(object_files,
+        create_sysimg_from_object_file(object_files,
                                     sysimage_path;
                                     compat_level,
                                     version,
@@ -1067,29 +1222,26 @@ function create_app(package_dir::String,
 
     ctx = create_pkg_context(package_dir)
     ctx.env.pkg === nothing && error("expected package to have a `name` and `uuid`")
-    @phase "instantiate" Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
+    Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
 
     if executables === nothing
         executables = [ctx.env.pkg.name => "julia_main"]
     end
-    @phase "remove-output" try_rm_dir(app_dir; force)
+    try_rm_dir(app_dir; force)
     stdlibs = gather_stdlibs_project(ctx)
     if !filter_stdlibs
         stdlibs = unique(vcat(stdlibs, map(pkg -> pkg.name, stdlibs_in_default_sysimage())))
     end
-    library_info = @phase "bundle-libraries" bundle_julia_libraries(app_dir, stdlibs; quiet)
-    artifact_info = @phase "bundle-artifacts" bundle_artifacts(ctx, app_dir; include_lazy_artifacts, quiet)
-    @phase "bundle-rest" begin
-        bundle_julia_libexec(ctx, app_dir)
-        bundle_julia_executable(app_dir)
-        bundle_project(ctx, app_dir)
-        include_preferences && bundle_preferences(ctx, app_dir)
-        bundle_cert(app_dir)
-    end
-    quiet || print_bundle_info(library_info, artifact_info)
+    # Find the artifacts and install them before anything runs beside this task.
+    # This is the only part of the bundle work that calls Pkg, and Pkg is not safe
+    # for more than one task.
+    bundled_artifacts = collect_bundled_artifacts(ctx; include_lazy_artifacts)
 
     # Sysimage always goes in lib/julia/ (this is hardcoded in the Julia binary)
     sysimage_path = joinpath(app_dir, "lib", "julia", "sys." * Libdl.dlext)
+    # Both the bundle steps and the system-image build write this directory.
+    # Create it here so that neither of them races the other for it.
+    mkpath(dirname(sysimage_path))
 
     package_name = ctx.env.pkg.name
     project = dirname(ctx.env.project_file)
@@ -1104,21 +1256,64 @@ function create_app(package_dir::String,
     push!(precompiles, "precompile(Tuple{typeof(empty!), Vector{String}})")
     push!(precompiles, "precompile(Tuple{typeof(popfirst!), Vector{String}})")
 
-    @phase "create-sysimage" create_sysimage([package_name]; sysimage_path, project,
-                    incremental,
-                    filter_stdlibs,
-                    precompile_execution_file,
-                    precompile_statements_file,
-                    cpu_target,
-                    sysimage_build_args,
-                    compress_sysimage,
-                    include_transitive_dependencies,
-                    extra_precompiles = join(precompiles, "\n"),
-                    script)
-
-    @phase "launcher" for (app_name, julia_main) in executables
-        create_executable_from_sysimg(joinpath(app_dir, "bin", app_name), c_driver_program, string(package_name, ".", julia_main))
+    # Copy the files of the app while the system image compiles.
+    #
+    # The system-image build spends nearly all of its wall clock inside `run` on a
+    # child process, and `run` gives the scheduler the task back. The copies then
+    # cost no wall clock at all. Put the copies on the spawned task and the
+    # system-image build on this one, not the other way round: a copy is a blocking
+    # system call that never yields, so a copy task that ran first would hold the
+    # thread and the compiler would not start until every file was copied.
+    #
+    # Keep the spinners of the copies silent. The system-image build animates its
+    # own spinner at the same time, and two spinners fight for the same line.
+    bundle_task = Threads.@spawn begin
+        library_info = bundle_julia_libraries(app_dir, stdlibs; quiet=true)
+        artifact_info = copy_bundled_artifacts(bundled_artifacts, app_dir; quiet=true)
+        bundle_julia_libexec(ctx, app_dir)
+        bundle_julia_executable(app_dir)
+        bundle_project(ctx, app_dir)
+        include_preferences && bundle_preferences(ctx, app_dir)
+        bundle_cert(app_dir)
+        (library_info, artifact_info)
     end
+
+    sysimage_error = nothing
+    try
+        @phase "create-sysimage" create_sysimage([package_name]; sysimage_path, project,
+                        incremental,
+                        filter_stdlibs,
+                        precompile_execution_file,
+                        precompile_statements_file,
+                        cpu_target,
+                        sysimage_build_args,
+                        compress_sysimage,
+                        include_transitive_dependencies,
+                        extra_precompiles = join(precompiles, "\n"),
+                        script)
+    catch e
+        sysimage_error = e
+    end
+
+    # Always join, so that a failed build never leaves the copies running behind
+    # this call. Report the system-image error first: it is the more useful one.
+    bundle_result = try
+        fetch(bundle_task)
+    catch e
+        sysimage_error === nothing || throw(sysimage_error)
+        throw(first_cause(e))
+    end
+    sysimage_error === nothing || throw(sysimage_error)
+    library_info, artifact_info = bundle_result
+
+    quiet || print_bundle_info(library_info, artifact_info)
+
+    # Each executable starts its own C compiler, so they build at the same time.
+    run_in_parallel(executables) do (app_name, julia_main)
+        create_executable_from_sysimg(joinpath(app_dir, "bin", app_name), c_driver_program,
+                                      string(package_name, ".", julia_main))
+    end
+    return nothing
 end
 
 
@@ -1689,13 +1884,20 @@ function _collect_artifacts(pkg_root::String; platform::Base.BinaryPlatforms.Abs
     return artifacts_tomls
 end
 
-function bundle_artifacts(ctx, dest_dir; include_lazy_artifacts::Bool, quiet::Bool=false)
+"""
+    collect_bundled_artifacts(ctx; include_lazy_artifacts) -> Vector
+
+Find the artifacts of a project and make sure that each one is installed.
+
+This is the half of the artifact work that calls Pkg. Pkg is not safe for more
+than one task, so this half runs alone. `copy_bundled_artifacts` does the other
+half, which only copies files and can run beside a system-image build.
+"""
+function collect_bundled_artifacts(ctx; include_lazy_artifacts::Bool)
     pkgs = load_all_deps(ctx)
 
     # TODO: Allow override platform?
     platform = Base.BinaryPlatforms.HostPlatform()
-    depot_path = joinpath(dest_dir, "share", "julia")
-    artifact_app_path = joinpath(depot_path, "artifacts")
 
     source_paths_names = Tuple{String, String}[]
     for pkg in pkgs
@@ -1736,11 +1938,25 @@ function bundle_artifacts(ctx, dest_dir; include_lazy_artifacts::Bool, quiet::Bo
         end
     end
 
+    sort!(bundled_artifacts)
+    return bundled_artifacts
+end
+
+"""
+    copy_bundled_artifacts(bundled_artifacts, dest_dir; quiet) -> BundledArtifacts
+
+Copy the artifacts that `collect_bundled_artifacts` found into the app.
+
+This half only copies files. It calls neither Pkg nor the compiler, so it can run
+beside a system-image build.
+"""
+function copy_bundled_artifacts(bundled_artifacts, dest_dir; quiet::Bool=false)
+    artifact_app_path = joinpath(dest_dir, "share", "julia", "artifacts")
+
     if !isempty(bundled_artifacts)
         mkpath(artifact_app_path)
     end
 
-    sort!(bundled_artifacts)
     isempty(bundled_artifacts) && return BundledArtifacts(BundledArtifactGroup[])
 
     n_artifacts = sum(length(a) for (_, a) in bundled_artifacts; init=0)
@@ -1752,6 +1968,11 @@ function bundle_artifacts(ctx, dest_dir; include_lazy_artifacts::Bool, quiet::Bo
     # Returns summary / destination paths for reporting later
     return TerminalSpinners.@spin spinner _copy_artifacts(
         bundled_artifacts, artifact_app_path, progress, current_pkg)
+end
+
+function bundle_artifacts(ctx, dest_dir; include_lazy_artifacts::Bool, quiet::Bool=false)
+    bundled_artifacts = collect_bundled_artifacts(ctx; include_lazy_artifacts)
+    return copy_bundled_artifacts(bundled_artifacts, dest_dir; quiet)
 end
 
 function _copy_artifacts(bundled_artifacts, artifact_app_path,

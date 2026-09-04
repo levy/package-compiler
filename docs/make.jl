@@ -12,6 +12,7 @@ makedocs(
             "sysimages.md",
             "apps.md",
             "libs.md",
+            "speed.md",
         ],
 
         "Examples" => [
