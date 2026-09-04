@@ -101,17 +101,42 @@ end
 
 How many independent build steps run at the same time.
 
-`PACKAGECOMPILER_JOBS` sets the number. Without it the number is the count of
-CPUs, capped by `JULIA_CPU_THREADS` the same way Julia caps its own thread
-counts. The count is never less than 1.
+`PACKAGECOMPILER_JOBS` sets the number. Without it the number is the count that
+Julia itself uses, `jl_effective_threads`. That count follows the CPU affinity of
+the process, so a build under `taskset` asks for the CPUs it may use and not for
+every CPU of the machine. `JULIA_CPU_THREADS` caps it, as it caps the thread
+counts of Julia. The count is never less than 1.
 """
 function build_jobs()
     n = tryparse(Int, get(ENV, "PACKAGECOMPILER_JOBS", ""))
     if n === nothing
+        available = try
+            Int(ccall(:jl_effective_threads, Cint, ()))
+        catch
+            Sys.CPU_THREADS
+        end
         cap = tryparse(Int, get(ENV, "JULIA_CPU_THREADS", ""))
-        n = cap === nothing ? Sys.CPU_THREADS : min(Sys.CPU_THREADS, cap)
+        n = cap === nothing ? available : min(available, cap)
     end
     return max(n, 1)
+end
+
+"""
+    with_image_threads(cmd::Cmd) -> Cmd
+
+Give a system-image build every CPU for the part that writes the object file.
+
+Julia writes that object file on more than one thread, but it asks for only
+`jl_effective_threads() / 2` of them: half of the CPUs. `JULIA_IMAGE_THREADS`
+sets the number instead. This is the one setting that adds cores to a
+system-image build. The front half of such a build infers types, and Julia infers
+under one global lock, so no setting makes that half faster.
+
+A number that the caller already set stays as it is.
+"""
+function with_image_threads(cmd::Cmd)
+    haskey(ENV, "JULIA_IMAGE_THREADS") && return cmd
+    return addenv(cmd, "JULIA_IMAGE_THREADS" => string(build_jobs()))
 end
 
 """
@@ -526,9 +551,9 @@ function create_fresh_base_sysimage(; cpu_target::String, sysimage_build_args::C
         spinner = TerminalSpinners.Spinner(msg = "PackageCompiler: creating compiler sysimage (incremental=false)")
         TerminalSpinners.@spin spinner begin
             # Create corecompiler object file
-            cmd = `$(get_julia_cmd()) --cpu-target $cpu_target
+            cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target $cpu_target
                 --output-o $tmp_corecompiler_o $sysimage_build_args
-                $compiler_source_path $compiler_args`
+                $compiler_source_path $compiler_args`)
             @debug "running $cmd"
 
             read(cmd)
@@ -549,7 +574,7 @@ function create_fresh_base_sysimage(; cpu_target::String, sysimage_build_args::C
             new_sysimage_source_path = joinpath(tmp, "sysimage_packagecompiler_$(uuid1()).jl")
             write(new_sysimage_source_path, new_sysimage_content)
             try
-                cmd = addenv(`$(get_julia_cmd()) --cpu-target $cpu_target
+                cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target $cpu_target
                     --sysimage=$tmp_corecompiler_sl --threads=1
                     $sysimage_build_args --output-o=$tmp_sys_o
                     $new_sysimage_source_path $compiler_args`)
@@ -761,9 +786,14 @@ function create_sysimg_object_file(object_file::String,
     # or provided via JULIA_NUM_THREADS.
     # This is needed until the underlying bug is fixed (see https://github.com/JuliaLang/PackageCompiler.jl/issues/963 and especially
     # https://github.com/JuliaLang/PackageCompiler.jl/issues/990 containing a `git bisect` to the commit introducing the problem)
-    cmd = `$(get_julia_cmd()) --cpu-target=$cpu_target $sysimage_build_args
+    #
+    # `--threads` is the count of runtime worker threads. It does not reach the
+    # code that writes the object file: `src/aotcompile.cpp` of Julia never reads
+    # `jl_options.nthreads`. `with_image_threads` sets the count that this code
+    # does read, so the pin above stays and the object file still uses every CPU.
+    cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$cpu_target $sysimage_build_args
         --sysimage=$base_sysimage --project=$project --output-o=$(object_file)
-        --threads=1 $outputo_file`
+        --threads=1 $outputo_file`)
     @debug "running $cmd"
 
     non = incremental ? "" : "non"

@@ -29,13 +29,29 @@ built on the same machine, so read the wall times as an upper bound.
 | `create_fresh_base_sysimage` | **0.0 s** (the cache answered) |
 | `ensurecompiled` | **113.1 s** |
 | `run_precompilation_script` | **41.5 s** |
-| `create_sysimg_object_file` | (see below) |
+| `create_sysimg_object_file` | **342.7 s** |
+| link the system image | 1.7 s |
+| build the executable | 0.9 s |
+| **total** | **~509 s** |
+
+Three numbers decide the work:
+
+1. `create_sysimg_object_file` is **67%** of the build.
+2. `ensurecompiled` is **22%**.
+3. Everything that copies files is **1.6%**.
 
 The cache of the base system image works: 0.0 s in place of several minutes.
 
 `ensurecompiled` costs 113 s but reports that it precompiled the packages in 24
 seconds. The rest is the start of Julia on the fresh base system image. That
 image holds no compiled code for Pkg, so `using Pkg` compiles Pkg from source.
+`get_julia_cmd` passes `--pkgimages=no` to every child, which is why. This is
+still open work.
+
+`create_sysimg_object_file` used 691.8 seconds of CPU in 316 seconds of wall
+clock, a ratio of 2.18 in a lane of 8 CPUs. The phase is a serial front that
+infers types and a parallel tail that writes the object file. Only the tail can
+take more cores.
 
 ## The multi-target build is the other big cost
 
@@ -79,21 +95,44 @@ causes a build error. Therefore PackageCompiler can not split the front half of 
 
 ## The steps
 
-- [ ] 1. Measure the phases of a full `create_app` build. Record the numbers here.
-- [ ] 2. Measure `JULIA_IMAGE_THREADS`. Compare the default with the full CPU count.
-- [ ] 3. Give PackageCompiler a job count. Read `PACKAGECOMPILER_JOBS`, else the
-      CPU count.
-- [ ] 4. Run the precompile execution files at the same time. Each file starts its
-      own Julia process, so this needs no threads in the parent.
-- [ ] 5. Build the executables of an app at the same time. Each one starts a C
-      compiler.
-- [ ] 6. Overlap the file copies of an app with the system-image build. The
-      system-image build waits on a child process, so the parent is free to copy.
-      Keep every call into Pkg on one task, because Pkg is not safe for more than
-      one task.
-- [ ] 7. Copy the artifacts and the libraries on many threads when the parent has
-      them.
+- [x] 1. Measure the phases of a full `create_app` build. Recorded above.
+- [ ] 2. Measure `JULIA_IMAGE_THREADS`. Compare the default with the full CPU
+      count. The run is in progress at 4, 8 and 4 threads.
+- [x] 3. Give PackageCompiler a job count. `build_jobs` reads
+      `PACKAGECOMPILER_JOBS`, else `jl_effective_threads`.
+- [x] 4. Run the precompile execution files at the same time.
+- [x] 5. Build the executables of an app at the same time.
+- [x] 6. Overlap the file copies of an app with the system-image build.
+- [x] 7. Ask for every CPU when Julia writes the object file. `with_image_threads`
+      sets `JULIA_IMAGE_THREADS` on all three `--output-o` children.
+- [ ] 8. Look at `ensurecompiled`. It is 22% of the build, and most of that is
+      Julia that compiles Pkg from source because `get_julia_cmd` passes
+      `--pkgimages=no`.
+- [ ] 9. Measure the whole `create_app` before and against after.
 
 ## Decisions found during the work
 
-(Record decisions here as the work proceeds.)
+**Put the copies on the spawned task, not the compiler.** A default Julia process
+has one thread, so a spawned task runs only when the running task gives the
+thread back. A system-image build waits inside `run` on a child process and gives
+the thread back often. A file copy is a blocking system call and never gives it
+back. Therefore the copies go on the spawned task and the system-image build
+stays on the main task. The other order would copy every file first and start the
+compiler late.
+
+**`--threads` on a child does not make a system image build faster.** It sets the
+runtime worker threads of the child. `src/aotcompile.cpp` of Julia never reads
+`jl_options.nthreads`. The pin to `--threads=1` in `create_sysimg_object_file` is
+a workaround for issues 963 and 990, and it stays.
+
+**`build_jobs` follows the CPU affinity.** It calls `jl_effective_threads`, the
+same count that Julia uses, instead of `Sys.CPU_THREADS`. A build under `taskset`
+then asks for the CPUs it may use. `Sys.CPU_THREADS` would ask for all 32 CPUs of
+the machine even inside an 8-CPU lane.
+
+**The cache needed an atomic publish.** Two builds on this machine shared the key
+`c37c13e8cbe01f86` and wrote the same path. The build now writes a private
+directory inside the cache and publishes the finished file with a rename.
+
+**Native is now the default target.** The user asked for native only. A
+multi-target build compiles every function three times, and that work is serial.
