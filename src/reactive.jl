@@ -91,11 +91,13 @@ function materialize_app(package_dir::String, app_dir::String;
                          cpu_target::String = default_app_cpu_target(),
                          sysimage_build_args::Cmd = ``,
                          server::Bool = get(ENV, "JULIA_REACTIVE_SERVER", "") == "1",
+                         trim::Symbol = Symbol(get(ENV, "JULIA_REACTIVE_TRIM", "off")),
                          image::Symbol = Symbol(get(ENV, "JULIA_REACTIVE_IMAGE_WRITE", "whole")),
                          founding::Bool = get(ENV, "JULIA_REACTIVE_FOUNDING", "") == "1",
                          compact::Tuple{Int, Float64} = _reactive_compact_env(),
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
                          kwargs...)
+    trim in (:off, :on, :once) || error("materialize_app: `trim` is :off, :on or :once, not :", trim)
     store = _reactive_store_dir(app_dir)
     if isfile(joinpath(store, REACTIVE_STORE_FILE)) && isfile(_reactive_sysimage(app_dir))
         image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
@@ -136,6 +138,7 @@ function materialize_app(package_dir::String, app_dir::String;
     return app_dir
 end
 
+function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                            tracked, workload, precompile_statements_file, cpu_target,
                            sysimage_build_args, kwargs...)
     package_dir = abspath(package_dir)
@@ -198,11 +201,19 @@ end
         "sysimage_build_args" => collect(sysimage_build_args.exec),
         "tracked" => [Dict{String, Any}("file" => file, "root" => root)
                       for (file, root) in zip(files, roots)],
+        "workload" => workload === nothing ? "" : abspath(workload),
         "executables" => [Any[String(name), String(main)] for (name, main) in executables],
         "founding_size" => filesize(_reactive_sysimage(app_dir)))
     _reactive_save(store, Dict{String, Any}("config" => config,
                                             "snapshot" => Any[_reactive_entry(1)]))
     @info "materialize_app: the store is founded" store statements = length(statements)
+    if trim != :off
+        reason = _reactive_trim_product(app_dir, store, Any[_reactive_entry(1)], 1, 1,
+                                        _reactive_sysimage(app_dir), nothing, config)
+        reason === nothing || error("materialize_app: the trimmer refuses the founding (T1):\n", reason)
+        _reactive_trim_commit(app_dir, config)
+        @info "materialize_app: the trimmed product is founded" bundle = joinpath(app_dir, "trimmed")
+    end
     return app_dir
 end
 
@@ -360,10 +371,18 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     trace = _reactive_trace(store)
     isfile(trace) || error("materialize_app: the store $store has no $REACTIVE_TRACE_FILE; found it again")
     script = joinpath(snapshot, "child.jl")
+    trimmed_archive = joinpath(snapshot, "trimmed.a")
     write(script, _reactive_child_script(old_files, _reactive_paths(old_roots), old_copies,
+                                         files, _reactive_paths(roots), old_reads, reads, refusal, trace;
+                                         trim = !server && trim != :off, trimmed = trimmed_archive,
+                                         overrides = _reactive_trim_overrides()))
     archive = joinpath(snapshot, "delta.a")
     next_sysimage = sysimage * ".next"
     base = snapshots[end]["id"]
+    session = nothing
+    # The overlay of this save (Stage G), linked beside the base; it joins
+    # the chain only when the save is complete, below.
+    overlay = ""
     if server
         # The server loaded the image of its base snapshot; its delta holds
         # every change since, so the link takes the texts of the base chain
@@ -422,11 +441,41 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
             reasons = read(refusal, String)
             rm(snapshot; recursive = true, force = true)
             rm(next_sysimage; force = true)
+            startswith(reasons, "T1") &&
+                error("materialize_app: the rebuild is refused (T1); the trimmer names the call sites:\n", reasons)
             error("materialize_app: the rebuild is refused; a founding build applies the change:\n", reasons)
         end
     end
     end
+    image == :overlay && !server && (overlay = _reactive_overlay_link(app_dir, archive, id))
     _reactive_extract_text(archive, snapshot)
+    if trim != :off
+        reason = _reactive_trim_product(app_dir, store, snapshots, base, id, next_sysimage, session, config;
+                                        prewritten = !server, overlay = image == :overlay)
+        if reason !== nothing
+            # The server applied the edit that the trimmer refuses: it stops,
+            # and the next build starts one from the last image. The chain
+            # and both bundles are as they were: the overlay of this save
+            # is not in the chain yet.
+            if session !== nothing
+                _reactive_request(session["socket"], "quit"; quiet = true)
+                rm(_reactive_server_session(store); force = true)
+            end
+            rm(snapshot; recursive = true, force = true)
+            rm(next_sysimage; force = true)
+            isempty(overlay) || rm(joinpath(dirname(sysimage), overlay); force = true)
+            error("materialize_app: the rebuild is refused (T1); the trimmer names the call sites:\n", reason)
+        end
+    end
+    if image == :overlay
+        # The server's overlay is cumulative since its start: it replaces
+        # the one it wrote before in the chain. A child's appends.
+        _reactive_chain_update(app_dir, overlay, session === nothing ? "" : get(session, "overlay", ""))
+        session === nothing || (session["overlay"] = overlay)
+    else
+        mv(next_sysimage, sysimage; force = true)
+    end
+    trim != :off && _reactive_trim_commit(app_dir, config)
     rm(archive)
     _reactive_copy_sources(files, snapshot)
     config["tracked"] = [Dict{String, Any}("file" => file, "root" => root)
@@ -436,6 +485,13 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     image == :overlay && (entry["overlay"] = overlay)
     push!(data["snapshot"], entry)
     _reactive_save(store, data)
+    if server
+        # The server's state is this snapshot now.
+        session["last"] = id
+        open(_reactive_server_session(store), "w") do io
+            TOML.print(io, session)
+        end
+    end
     growth = round(100 * _reactive_growth(app_dir, config); digits = 2)
     @info "materialize_app: snapshot s$id materialized" seconds = round(elapsed; digits = 1) server trim image growth_percent = growth
     return app_dir
@@ -447,6 +503,7 @@ _reactive_paths(roots) = Vector{Symbol}[isempty(root) ? Symbol[] : Symbol.(split
 # The top level of the rebuild child. Everything that varies is a literal
 # here; the function bodies are the stdlib's, compiled in the image.
 function _reactive_child_script(old_files, old_roots, old_copies, files, roots, old_reads,
+                                reads, refusal, trace; trim::Bool = false, trimmed = "", overrides = "")
     io = IOBuffer()
     println(io, "# generated by PackageCompiler.materialize_app — the rebuild child")
     println(io, _reactive_compiler_load())
@@ -463,7 +520,31 @@ function _reactive_child_script(old_files, old_roots, old_copies, files, roots, 
     # A global of Main stays in the image: the set of every method instance
     # would root the dead ones.
     println(io, "rc_state = nothing")
+    if trim
+        # The second output of a save (Stage E): this child loaded the base
+        # image and applied the edit, so a fork of it writes the trimmed
+        # archive from the same heap, before the exit path writes the
+        # untrimmed one. A trim refusal writes the verifier's reason to the
+        # refusal file with the id T1 and exits, and the builder rolls back.
+        println(io, "let ok = false")
+        println(io, "    try")
         println(io, "        ReactiveCompiler.rc_save($(repr(trimmed)); trim = true, overrides = $(repr(overrides)))")
+        println(io, "        ok = isfile($(repr(trimmed)))")
+        println(io, "    catch e")
+        println(io, "        Base.showerror(stderr, e, catch_backtrace()); println(stderr)")
+        println(io, "    end")
+        println(io, "    if !ok")
+        println(io, "        open($(repr(refusal)), \"w\") do io")
+        println(io, "            println(io, \"T1\")")
+        println(io, "            log = $(repr(trimmed)) * \".log\"")
+        println(io, "            isfile(log) && for l in readlines(log)")
+        println(io, "                (occursin(\"Verifier\", l) || occursin(\"Trim verify\", l) || occursin(\"TrimFailure\", l)) && println(io, l)")
+        println(io, "            end")
+        println(io, "        end")
+        println(io, "        exit(4)")
+        println(io, "    end")
+        println(io, "end")
+    end
     return String(take!(io))
 end
 
@@ -611,15 +692,20 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
             # The memory of the server: the code of every save and every
             # old method version stay until a restart. Past a number of
             # saves or a resident size the builder restarts it from the
+            # last image, which holds the same state. A server whose last
+            # snapshot is not the last of the store is behind it (a child
+            # build came after): it restarts too.
             saves = parse(Int, something(match(r"saves=(\d+)", status), ["0"])[1])
             rss_kb = parse(Int, something(match(r"rss_kb=(\d+)", status), ["0"])[1])
             max_saves = parse(Int, get(ENV, "JULIA_REACTIVE_SERVER_SAVES", "200"))
             max_rss_kb = parse(Int, get(ENV, "JULIA_REACTIVE_SERVER_RSS_KB", string(16 * 1024 * 1024)))
+            last = get(session, "last", session["base"])
             same_image = get(session, "image", "whole") == string(image) &&
                          get(session, "delta_opt", -1) == delta_opt
             if saves < max_saves && rss_kb < max_rss_kb && last == snapshots[end]["id"] && same_image
                 return session
             end
+            @info "materialize_app: the server restarts from the last image" saves rss_kb last latest = snapshots[end]["id"]
             _reactive_request(session["socket"], "quit"; quiet = true)
         else
             @warn "materialize_app: the server of the store does not answer; a new one starts" session
@@ -644,6 +730,7 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
         sleep(0.5)
     end
     time() < deadline || error("materialize_app: the server did not answer within 300 s; see ", log)
+    session = Dict{String, Any}("socket" => socket, "base" => base, "last" => base, "pid" => getpid(process),
                                 "image" => string(image), "overlay" => "", "delta_opt" => delta_opt,
                                 "started" => Libc.strftime("%Y-%m-%d %H:%M:%S", time()))
     open(session_file, "w") do io
@@ -653,10 +740,154 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
     return session
 end
 
+# ── the trimmed product ─────────────────────────────────────────────────────
+
+const TRIMMED_WRAPPER = joinpath(@__DIR__, "trimmed_wrapper.c")
+
+_reactive_trimmed_dir(app_dir) = joinpath(app_dir, "trimmed")
+
+# The patches to Base and to the stdlibs that a trimmed build needs, the
+# ones `juliac` applies before its write (test/trimming of the Julia tree):
+# the profile listener, `invokelatest`, `reinit_stdio` and a few `__init__`s
+# become trivial. Their directory beside this Julia, or nothing.
+function _reactive_trim_overrides()
+    dir = normpath(joinpath(Sys.BINDIR, "..", "..", "test", "trimming"))
+    isfile(joinpath(dir, "juliac-trim-base.jl")) && return dir
+    @warn "materialize_app: no test/trimming beside this Julia; the trimmed product goes without the patches of juliac" dir
+    return ""
+end
+
+# The script of the trim child: the preamble of the object script, the
+# patches of a trimmed build, the entry points, and the tail; the heap is
+# the loaded image, the trimmer prunes it from the entry points, and the
+# reused code serves what they reach.
+function _reactive_trim_script(package_dir)
+    overrides = _reactive_trim_overrides()
+    io = IOBuffer()
+    println(io, "# generated by PackageCompiler.materialize_app — the trim child")
+    println(io, "Base.reinit_stdio()")
+    println(io, "@eval Sys BINDIR = ccall(:jl_get_julia_bindir, Any, ())::String")
+    println(io, "@eval Sys STDLIB = ", repr(abspath(Sys.BINDIR, "../share/julia/stdlib", string('v', VERSION.major, '.', VERSION.minor))))
+    println(io, "copy!(LOAD_PATH, [", repr(package_dir), ", \"@stdlib\"])")
+    println(io, "Base.init_depot_path()")
+    if !isempty(overrides)
+        println(io, "include(", repr(joinpath(overrides, "juliac-trim-base.jl")), ")")
+        println(io, "include(", repr(joinpath(overrides, "juliac-trim-stdlib.jl")), ")")
+    end
     println(io, _reactive_compiler_load())
     println(io, "ReactiveCompiler.trim_entrypoints!()   # the entry points of the trim")
+    println(io, "empty!(Base.Filesystem.TEMP_CLEANUP)")
+    println(io, "empty!(Core.ARGS); empty!(Base.ARGS); empty!(LOAD_PATH); empty!(DEPOT_PATH)")
+    println(io, "empty!(Base.TOML_CACHE.d); Base.TOML.reinit!(Base.TOML_CACHE.p, \"\")")
+    println(io, "@eval Sys begin BINDIR = \"\"; STDLIB = \"\" end")
+    return String(take!(io))
+end
+
+# The reason of a refusal: the verifier's lines of the log, else the reply.
+function _reactive_trim_reason(log, reply)
+    isfile(log) || return reply
+    lines = filter(l -> occursin("Verifier", l) || occursin("Trim verify", l) || occursin("TrimFailure", l), readlines(log))
+    return isempty(lines) ? string(reply, "\n", join(last(readlines(log), 20), "\n")) : join(lines, "\n")
+end
+
+# The trimmed product of a snapshot: the archive that a trimmed write of
+# the heap gives, through the server or a child that loads `image`, linked
+# with the texts of the chain into `<app_dir>/trimmed/lib/julia/sys.so.next`.
+# Under `overlay` the link takes the founding's texts alone: the texts of an
+# overlay were compiled against the overlay's own slot table, and the
+# trimmed write compiled the functions of the overlays again (staticdata.c,
+# `jl_reactive_image_ids` under trim). Answers nothing, or the reason of the
+# trimmer's refusal.
+function _reactive_trim_product(app_dir, store, snapshots, base, id, image, session, config;
+                                prewritten = false, overlay = false)
+    archive = joinpath(_reactive_snapshot_dir(store, id), "trimmed.a")
+    log = archive * ".log"
+    if session !== nothing
+        # The server forks and writes the trimmed archive of its cumulative
+        # delta since its base.
+        rm(archive; force = true)
+        reply = _reactive_request(session["socket"], string("trim ", archive, " ", _reactive_trim_overrides()))
+        startswith(reply, "ok") || return _reactive_trim_reason(log, reply)
+    elseif prewritten
+        # No server, a delta: the apply child wrote the trimmed archive as
+        # its second output (see `_reactive_child_script`). A refusal was
+        # handled at the build; the archive of the trimmed delta is here.
+        isfile(archive) || return _reactive_trim_reason(log, "the apply child wrote no $archive")
+    else
+        # No server, the founding: a child loads the founding image and
+        # writes it trimmed. Every function is reused, so the archive is
+        # thin and the founding's texts carry the code; the linker drops
+        # the rest.
+        rm(archive; force = true)
+        script = joinpath(_reactive_snapshot_dir(store, id), "trim.jl")
+        write(script, _reactive_trim_script(config["package_dir"]))
+        cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$(config["cpu_target"])
+            $(Cmd(String.(config["sysimage_build_args"]))) --sysimage=$image
+            --project=$(config["package_dir"]) --output-o=$archive --output-incremental=no
             --strip-ir --strip-metadata --experimental --trim=safe --threads=1
             --reactive-reuse --reactive-trim-memo=$(joinpath(store, "trim-memo.txt")) $script`)
+        # The founding's pass writes the first memo of the store (see
+        # `rc_save` of the server for the memo).
+        ok = success(pipeline(cmd; stdout = log, stderr = log))
+        ok && isfile(archive) || return _reactive_trim_reason(log, "the trim child failed; see $log")
+    end
+    # The chain of the base carries the reused code; the archive carries the
+    # delta and the fresh function table. The untrimmed delta is never linked.
+    texts = overlay ? _reactive_texts(_reactive_snapshot_dir(store, snapshots[1]["id"])) :
+                      _reactive_link_texts(store, snapshots, base)
+    next = joinpath(_reactive_trimmed_dir(app_dir), "lib", "julia", "sys." * Libdl.dlext * ".next")
+    mkpath(dirname(next))
+    create_sysimg_from_object_file(vcat(texts, [archive]), next; version = nothing, compat_level = "major",
+                                   soname = "sys." * Libdl.dlext, gc_sections = true)
+    rm(archive)
+    # The trimmer walks the program from its C-callable entry points, and
+    # the launcher of the trimmed bundle calls the exported symbol: an entry
+    # point that is not `@ccallable` gives a trimmed image without the
+    # program, which is refused here, not found at the first run.
+    exported = Set{String}()
+    for line in eachline(`nm -D --defined-only $next`)
+        parts = split(line)
+        length(parts) == 3 && push!(exported, String(parts[3]))
+    end
+    for (name, main) in get(config, "executables", Any[])
+        main in exported && continue
+        rm(next; force = true)
+        return "the trimmed image exports no entry point `$main` for `$name`: declare it " *
+               "`Base.@ccallable function $main()::Cint`, so that the trimmer walks the program from it"
+    end
+    return nothing
+end
+
+# The trimmed bundle: its own launchers, the libraries of the untrimmed one
+# as hard links, and the trimmed image in place of the untrimmed.
+function _reactive_trim_commit(app_dir, config)
+    trimmed = _reactive_trimmed_dir(app_dir)
+    share = joinpath(app_dir, "share")
+    isdir(share) && !isdir(joinpath(trimmed, "share")) && run(`cp -al $share $(joinpath(trimmed, "share"))`)
+    # The launcher of a trimmed bundle calls the exported entry point; the
+    # launcher of the untrimmed bundle evaluates a string, which a trimmed
+    # image can not do.
+    executables = get(config, "executables", Any[Any[basename(config["package_dir"]), "julia_main"]])
+    for (name, main) in executables
+        exe = joinpath(trimmed, "bin", name)
+        isfile(exe) || create_executable_from_sysimg(exe, TRIMMED_WRAPPER, main)
+    end
+    lib = joinpath(app_dir, "lib")
+    for entry in readdir(lib)
+        target = joinpath(trimmed, "lib", entry)
+        entry == "julia" && continue
+        ispath(target) || run(`cp -al $(joinpath(lib, entry)) $target`)
+    end
+    for entry in readdir(joinpath(lib, "julia"))
+        target = joinpath(trimmed, "lib", "julia", entry)
+        startswith(entry, "sys." * Libdl.dlext) && continue
+        ispath(target) || run(`cp -al $(joinpath(lib, "julia", entry)) $target`)
+    end
+    image = joinpath(trimmed, "lib", "julia", "sys." * Libdl.dlext)
+    mv(image * ".next", image; force = true)
+    return nothing
+end
+
 """
     store_status(app_dir) -> NamedTuple, or nothing
 
