@@ -855,6 +855,9 @@ function create_sysimg_object_file(object_file::String,
     # The reactive image format (version 3, `src/reactive.jl`): the object file
     # carries one function table in id order, and every function and every
     # global slot sits in a section of its own, so that the link can drop the
+    # functions that no table names. The reactive Julia takes the flag.
+    format = reactive_image ? `--reactive-image-format` : ``
+    cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$cpu_target $sysimage_build_args $format
         --sysimage=$base_sysimage --project=$project --output-o=$(object_file)
         --threads=1 $outputo_file`)
     @debug "running $cmd"
