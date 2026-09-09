@@ -92,18 +92,48 @@ function materialize_app(package_dir::String, app_dir::String;
                          sysimage_build_args::Cmd = ``,
                          server::Bool = get(ENV, "JULIA_REACTIVE_SERVER", "") == "1",
                          image::Symbol = Symbol(get(ENV, "JULIA_REACTIVE_IMAGE_WRITE", "whole")),
+                         founding::Bool = get(ENV, "JULIA_REACTIVE_FOUNDING", "") == "1",
+                         compact::Tuple{Int, Float64} = _reactive_compact_env(),
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
                          kwargs...)
     store = _reactive_store_dir(app_dir)
     if isfile(joinpath(store, REACTIVE_STORE_FILE)) && isfile(_reactive_sysimage(app_dir))
         image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
         -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
+        # The garbage of the log: a rebuild appends to the image and never
+        # removes; past `compact` saves or growth, or on `founding`, the
+        # store founds again from the tracked files and the workload it
+        # recorded, and the chain starts over.
+        reason = _reactive_compact_reason(app_dir, store, founding, compact)
+        if reason === nothing
             return _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
+        end
+        config = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"]
+        isempty(tracked) && (tracked = [String(e["file"]) => String(e["root"]) for e in config["tracked"]])
+        workload === nothing && !isempty(get(config, "workload", "")) && (workload = String(config["workload"]))
+        @info "materialize_app: the store founds again" reason
+        stop_server(app_dir)
     end
     incremental ||
         error("materialize_app: the trace runs from the image of this process; `incremental = false` is not supported")
     haskey(kwargs, :precompile_execution_file) &&
         error("materialize_app: pass the script through `workload`; its trace is the store's trace.jl")
+    # The founding builds into a directory beside the app and swaps it in at
+    # the end: a build killed on the way leaves the old app and its store
+    # as they were, and a founding again keeps the old store until the new
+    # one is whole. The staging directory of a killed founding goes first.
+    app_dir = abspath(app_dir)
+    staging = app_dir * ".founding"
+    rm(staging; recursive = true, force = true)
+    _materialize_full(package_dir, staging, _reactive_store_dir(staging); trim,
+                      tracked, workload, precompile_statements_file = vcat(precompile_statements_file),
+                      cpu_target, sysimage_build_args, kwargs...)
+    old = app_dir * ".old"
+    rm(old; recursive = true, force = true)
+    ispath(app_dir) && mv(app_dir, old)
+    mv(staging, app_dir)
+    rm(old; recursive = true, force = true)
+    return app_dir
 end
 
                            tracked, workload, precompile_statements_file, cpu_target,
@@ -168,6 +198,8 @@ end
         "sysimage_build_args" => collect(sysimage_build_args.exec),
         "tracked" => [Dict{String, Any}("file" => file, "root" => root)
                       for (file, root) in zip(files, roots)],
+        "executables" => [Any[String(name), String(main)] for (name, main) in executables],
+        "founding_size" => filesize(_reactive_sysimage(app_dir)))
     _reactive_save(store, Dict{String, Any}("config" => config,
                                             "snapshot" => Any[_reactive_entry(1)]))
     @info "materialize_app: the store is founded" store statements = length(statements)
@@ -228,8 +260,20 @@ _reactive_statements(file) = String[line for line in eachline(file) if startswit
 # them, and the binary never calls them.
 _reactive_roots(statements) = unique!(filter(line -> !occursin(r"\bMain\.", line), statements))
 
+# `JULIA_REACTIVE_COMPACT="saves,growth"`: found again after that many saves
+# or that much growth of the image since the founding.
+function _reactive_compact_env()
+    value = get(ENV, "JULIA_REACTIVE_COMPACT", "50,0.25")
+    parts = split(value, ',')
+    length(parts) == 2 || error("materialize_app: JULIA_REACTIVE_COMPACT is `saves,growth`, not `", value, "`")
+    return (parse(Int, strip(parts[1])), parse(Float64, strip(parts[2])))
+end
+
 # The growth of the image since the founding, as a fraction of the founding's
 # size; the overlays of the chain count with the base.
+function _reactive_growth(app_dir, config)
+    founding_size = get(config, "founding_size", 0)
+    founding_size > 0 || return 0.0
     sysimage = _reactive_sysimage(app_dir)
     size = filesize(sysimage)
     for name in _reactive_chain_read(app_dir)
@@ -278,6 +322,19 @@ function _reactive_chain_update(app_dir, name, replaced)
         rm(joinpath(dirname(_reactive_sysimage(app_dir)), replaced); force = true)
     end
     return names
+end
+
+# Why the store founds again, or nothing.
+function _reactive_compact_reason(app_dir, store, founding, compact)
+    founding && return "founding = true"
+    data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
+    saves = length(data["snapshot"]) - 1
+    saves >= compact[1] && return "$saves saves since the founding, the bound is $(compact[1])"
+    growth = _reactive_growth(app_dir, data["config"])
+    growth >= compact[2] && return "the image grew $(round(100 * growth; digits = 1)) % since the founding, the bound is $(round(100 * compact[2]; digits = 1)) %"
+    return nothing
+end
+
 function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim::Symbol = :off,
                             image::Symbol = :whole, delta_opt::Int = -1)
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
@@ -379,6 +436,8 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     image == :overlay && (entry["overlay"] = overlay)
     push!(data["snapshot"], entry)
     _reactive_save(store, data)
+    growth = round(100 * _reactive_growth(app_dir, config); digits = 2)
+    @info "materialize_app: snapshot s$id materialized" seconds = round(elapsed; digits = 1) server trim image growth_percent = growth
     return app_dir
 end
 
