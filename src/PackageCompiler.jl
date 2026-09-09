@@ -45,6 +45,7 @@ include("juliaconfig.jl")
 include("../ext/TerminalSpinners.jl")
 include("library_selection.jl")
 include("reactive.jl")
+include("reactive_cli.jl")
 
 
 ##############
@@ -1266,6 +1267,18 @@ function create_app(package_dir::String,
                     script::Union{Nothing, String}=nothing,
                     quiet::Bool=false,
                     keep_object_archive::Union{Nothing, String}=nothing,
+                    reactive_image::Bool=false,
+                    reactive::Union{Bool, Symbol}=:auto)
+    # A reactive store under the app directory makes the build a rebuild
+    # through `materialize_app` (`:auto`, the default); `true` founds one
+    # when there is none; `false` builds plain although a store exists,
+    # and the store goes with the old output.
+    reactive in (true, false, :auto) || error("create_app: `reactive` is true, false or :auto, not ", repr(reactive))
+    if reactive === true || (reactive === :auto && isdir(_reactive_store_dir(app_dir)))
+        return materialize_app(package_dir, app_dir; executables, precompile_statements_file, incremental,
+                               force, cpu_target, include_lazy_artifacts, sysimage_build_args,
+                               compress_sysimage, include_transitive_dependencies, include_preferences)
+    end
     if filter_stdlibs && incremental
         error("must use `incremental=false` to use `filter_stdlibs=true`")
     end

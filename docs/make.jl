@@ -13,6 +13,7 @@ makedocs(
             "apps.md",
             "libs.md",
             "speed.md",
+            "reactive.md",
         ],
 
         "Examples" => [

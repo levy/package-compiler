@@ -87,3 +87,9 @@ PackageCompiler 2.0 comes with a few breaking changes.
 - The keyword `app_name` in `create_app` has been removed and replaced with a more flexible version.
   If you used `app_name="Foo"`, replace it with `executables=["Foo"=>"julia_main"]`.
 - The `@ccallable` in front of the entry point functions of apps should be removed. Failure to do so might lead to strange errors during creation of the app.
+
+## Reactive builds
+
+This branch (`reactive`, for the reactive Julia) rebuilds an app in about a
+second after an edit: [Reactive builds](@ref reactive), with
+`materialize_app` and `julia -m PackageCompiler build|status|stop|watch`.

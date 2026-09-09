@@ -10,6 +10,8 @@
 # the save and the server — is the stdlib `ReactiveCompiler` of that Julia,
 # in every image it builds; this file is a client of its protocol.
 
+export materialize_app, refresh_trace, stop_server, server_status, store_status,
+       tracked_sources, watch_app, print_store_status
 
 # The harness of the reactive compiler: the stdlib `ReactiveCompiler` of the
 # reactive Julia, in its system image, found by its uuid so that no
@@ -116,6 +118,9 @@ function materialize_app(package_dir::String, app_dir::String;
         @info "materialize_app: the store founds again" reason
         stop_server(app_dir)
     end
+    # The tracked files of a founding: the includes of the package's root
+    # file, unless the caller names them.
+    isempty(tracked) && (tracked = tracked_sources(package_dir))
     incremental ||
         error("materialize_app: the trace runs from the image of this process; `incremental = false` is not supported")
     haskey(kwargs, :precompile_execution_file) &&
@@ -188,6 +193,7 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                incremental = true, cpu_target,
                sysimage_build_args = Cmd(vcat(String.(sysimage_build_args.exec), ["--reactive-image=whole"])),
                keep_object_archive = archive,
+               precompile_statements_file = trace, reactive_image = true, reactive = false, kwargs...)
     snapshot = _reactive_snapshot_dir(store, 1)
     mkpath(snapshot)
     _reactive_extract_text(archive, snapshot)
@@ -967,4 +973,178 @@ function _reactive_save(store, data)
         TOML.print(io, data)
     end
     return nothing
+end
+
+# ── the tracked sources of a package ────────────────────────────────────────
+
+"""
+    tracked_sources(package_dir) -> Vector{Pair{String,String}}
+
+The source files of the package at `package_dir`, each with the dotted name
+of the module whose `include` loads it — the `tracked` list that
+`materialize_app` takes, and the default of a founding.
+
+Read from the package's root file: every literal `include("…")` at the top
+level of a module is a tracked file, evaluated in that module, and a
+`module` block names a deeper module for what it includes. The walk follows
+the included files too.
+
+The root file comes first, with the empty module path: its top level is the
+`module Pkg … end` block itself, so an `include` or a `using` that joins the
+module body is an edit of a tracked file, and the rebuild applies it or
+refuses it with a reason. An `include` whose argument is not a string
+literal, and one inside a function, are not tracked: the walk names them and
+tracks nothing for them.
+"""
+function tracked_sources(package_dir::AbstractString)
+    project = joinpath(package_dir, "Project.toml")
+    isfile(project) || error("tracked_sources: no Project.toml under $package_dir")
+    name = get(TOML.parsefile(project), "name", nothing)
+    name isa String || error("tracked_sources: the project under $package_dir has no name")
+    root = joinpath(package_dir, "src", name * ".jl")
+    isfile(root) || error("tracked_sources: no root file $root")
+    tracked = Pair{String,String}[root => ""]
+    _walk_includes(_parse_file(root), root, "", tracked)
+    return tracked
+end
+
+_parse_file(file) = Meta.parseall(read(file, String); filename = file)
+
+# The blocks whose `include` runs when the module loads. An `include` anywhere
+# else — a function body, a macro — runs later or never, and is not tracked.
+const _TOPLEVEL_HEADS = (:toplevel, :block, :if, :elseif, :macrocall, :module)
+
+function _walk_includes(expr, file, module_path, tracked)
+    expr isa Expr || return
+    if expr.head === :call && !isempty(expr.args) && expr.args[1] === :include
+        if length(expr.args) == 2 && expr.args[2] isa AbstractString
+            included = normpath(joinpath(dirname(file), expr.args[2]))
+            isfile(included) || error("tracked_sources: $file includes $included, " *
+                                      "which does not exist")
+            if isempty(module_path)
+                @warn "tracked_sources: an include outside every module is not tracked" file included
+            else
+                push!(tracked, included => module_path)
+                _walk_includes(_parse_file(included), included, module_path, tracked)
+            end
+        else
+            @warn "tracked_sources: an include that is not a string literal is not tracked" file expr
+        end
+        return
+    end
+    expr.head in _TOPLEVEL_HEADS || return
+    if expr.head === :module
+        name = String(expr.args[2]::Symbol)
+        module_path = isempty(module_path) ? name : module_path * "." * name
+    end
+    for argument in expr.args
+        _walk_includes(argument, file, module_path, tracked)
+    end
+end
+
+# ── the status and the watch ─────────────────────────────────────────────────
+
+"""
+    print_store_status(io, app_dir) -> Bool
+
+Print what the reactive store under `app_dir` holds — the founding, the
+snapshots, the chain of overlays of the bundle, the server, the growth — and
+answer whether there is one.
+"""
+function print_store_status(io::IO, app_dir::AbstractString)
+    status = store_status(String(app_dir))
+    if status === nothing
+        println(io, "no reactive store under $app_dir")
+        return false
+    end
+    mb(bytes) = string(round(bytes / 2^20; digits = 1), " MB")
+    println(io, "reactive store of $app_dir")
+    println(io, "  founding:   image $(mb(status.founding_size)), $(length(status.tracked)) tracked files",
+            isempty(status.workload) ? "" : ", workload $(status.workload)")
+    println(io, "  snapshots:  $(length(status.snapshots)) (s$(first(status.snapshots)) to s$(last(status.snapshots)))")
+    println(io, "  image:      $(mb(status.image_size))",
+            isempty(status.chain) ? "" : " + " * join(["$name $(mb(size))" for (name, size) in status.chain], ", "))
+    println(io, "  growth:     $(round(100 * status.growth; digits = 1)) % since the founding")
+    session = status.session
+    if session === nothing
+        println(io, "  server:     none")
+    else
+        println(io, "  server:     pid $(session["pid"]) ", session["alive"] ? "answers" : "does not answer",
+                ", started from s$(session["base"]) on $(session["started"]), last s$(get(session, "last", session["base"]))",
+                ", image $(get(session, "image", "whole"))")
+    end
+    return true
+end
+
+"""
+    watch_app(app_dir, build; io = stdout, settle = 0.5)
+
+Rebuild on every change of a tracked file of the store under `app_dir`,
+until Ctrl-C. `build` is a function of no argument that runs the build. A
+change is a new modification time of a tracked file (the store's list); the
+watch waits until the files stayed still for `settle` seconds, then calls
+`build` and prints the seconds. A build that fails — a refused edit, a syntax
+error — prints its error, and the watch goes on. Ctrl-C stops the watch and
+the compiler server.
+"""
+function watch_app(app_dir::AbstractString, build; io::IO = stdout, settle::Real = 0.5)
+    status = store_status(String(app_dir))
+    status === nothing &&
+        error("watch_app: no reactive store under $app_dir; found one first")
+    stamps = Dict{String,Float64}(file => (isfile(file) ? mtime(file) : 0.0) for file in status.tracked)
+    # A line is flushed as it is printed: `stdout` to a file is buffered, and
+    # the watch runs for hours.
+    say(parts...) = (println(io, parts...); flush(io); flush(stderr))
+    say("watch: $(length(stamps)) tracked files of $app_dir; Ctrl-C stops the watch and the server")
+    # A script exits on Ctrl-C by default; the watch catches it to stop the
+    # server, and gives the default back when it ends.
+    Base.exit_on_sigint(false)
+    try
+        while true
+            changed = _changed_files!(stamps)
+            if isempty(changed)
+                sleep(settle)
+                continue
+            end
+            # An editor writes a file in steps, and a person saves several: wait
+            # until nothing changed for a settle time.
+            while true
+                sleep(settle)
+                more = _changed_files!(stamps)
+                isempty(more) && break
+                union!(changed, more)
+            end
+            say("watch: ", join(basename.(sort!(collect(changed))), ", "), " changed; rebuild")
+            started = time()
+            try
+                build()
+                say("watch: rebuilt in $(round(time() - started; digits = 1)) s")
+            catch error
+                error isa InterruptException && rethrow()
+                say("watch: the rebuild failed after $(round(time() - started; digits = 1)) s: ",
+                    sprint(showerror, error))
+                say("watch: the watch goes on; fix the edit and save")
+            end
+        end
+    catch error
+        error isa InterruptException || rethrow()
+        say("\nwatch: stopped")
+        stop_server(String(app_dir)) && say("watch: the compiler server was stopped")
+    finally
+        Base.exit_on_sigint(true)
+    end
+    return nothing
+end
+
+# The files of `stamps` whose modification time is not the recorded one; the
+# record is updated, so a file is answered once per change.
+function _changed_files!(stamps::Dict{String,Float64})
+    changed = Set{String}()
+    for (file, stamp) in stamps
+        now = isfile(file) ? mtime(file) : 0.0
+        now == stamp && continue
+        stamps[file] = now
+        push!(changed, file)
+    end
+    return changed
 end
