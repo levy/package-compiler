@@ -954,6 +954,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                          # sections. It holds one CPU target, and it needs the
                          # reactive Julia to write it and to load it.
                          reactive_image::Bool=false,
+                         link::Bool=true,
                          )
     # We call this at the very beginning to make sure that the user has a compiler available. Therefore, if no compiler
     # is found, we throw an error immediately, instead of making the user wait a while before the error is thrown.
@@ -1061,6 +1062,9 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
             end
         end
         # The extra objects go in front of the delta, and they are not deleted
+        # below: they belong to the store, not to this build. An overlay build
+        # keeps the archive alone and links nothing here.
+        link && create_sysimg_from_object_file(vcat(extra_object_files, object_files),
                                     sysimage_path;
                                     compat_level,
                                     version,

@@ -45,6 +45,13 @@ of the edit.
   link the text objects of every snapshot in front of the delta into a fresh
   system image. Only `lib/julia/sys.<ext>` of the bundle changes.
 
+Two options shape the rebuild. `trim = :on` (`JULIA_REACTIVE_TRIM`) writes
+a trimmed image beside the untrimmed one, into `<app_dir>/trimmed`, and
+refuses an edit that makes a call site dynamic. `image = :pages`
+(`JULIA_REACTIVE_IMAGE_WRITE`) makes the rebuild write only the pages of
+the image that the process wrote and append the new objects; the clean
+pages come from the file of the base image. The founding writes whole.
+
 `tracked` is a vector of `file => module` pairs: a source file to watch, and
 the dotted path of the module whose `include` loads it — the empty path for
 the root file of the package, whose top level is the `module` block itself.
@@ -84,10 +91,12 @@ function materialize_app(package_dir::String, app_dir::String;
                          cpu_target::String = default_app_cpu_target(),
                          sysimage_build_args::Cmd = ``,
                          server::Bool = get(ENV, "JULIA_REACTIVE_SERVER", "") == "1",
+                         image::Symbol = Symbol(get(ENV, "JULIA_REACTIVE_IMAGE_WRITE", "whole")),
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
                          kwargs...)
     store = _reactive_store_dir(app_dir)
     if isfile(joinpath(store, REACTIVE_STORE_FILE)) && isfile(_reactive_sysimage(app_dir))
+        image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
         -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
             return _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
     end
@@ -219,6 +228,57 @@ _reactive_statements(file) = String[line for line in eachline(file) if startswit
 # them, and the binary never calls them.
 _reactive_roots(statements) = unique!(filter(line -> !occursin(r"\bMain\.", line), statements))
 
+# The growth of the image since the founding, as a fraction of the founding's
+# size; the overlays of the chain count with the base.
+    sysimage = _reactive_sysimage(app_dir)
+    size = filesize(sysimage)
+    for name in _reactive_chain_read(app_dir)
+        path = joinpath(dirname(sysimage), name)
+        isfile(path) && (size += filesize(path))
+    end
+    return (size - founding_size) / founding_size
+end
+
+# ── the overlay chain (Stage G) ──────────────────────────────────────────
+# `<image>.chain` names the overlays the loader applies to the base, one
+# per line, relative to the image's directory.
+_reactive_chain_file(app_dir) = _reactive_sysimage(app_dir) * ".chain"
+
+function _reactive_chain_read(app_dir)
+    chain = _reactive_chain_file(app_dir)
+    isfile(chain) || return String[]
+    return String[strip(l) for l in eachline(chain) if !isempty(strip(l)) && !startswith(strip(l), "#")]
+end
+
+# Link the archive of a save into the overlay `sys.<id>.<ext>` beside the base.
+function _reactive_overlay_link(app_dir, archive, id)
+    sysimage = _reactive_sysimage(app_dir)
+    name = string("sys.", id, ".", Libdl.dlext)
+    create_sysimg_from_object_file([archive], joinpath(dirname(sysimage), name);
+                                   version = nothing, compat_level = "major", soname = name, gc_sections = true)
+    return name
+end
+
+# Put `name` into the chain: in the place of `replaced` when the chain has
+# it (a server's newer overlay), else at the end; the replaced file goes.
+function _reactive_chain_update(app_dir, name, replaced)
+    names = _reactive_chain_read(app_dir)
+    index = isempty(replaced) ? nothing : findfirst(==(replaced), names)
+    if index === nothing
+        push!(names, name)
+    else
+        names[index] = name
+    end
+    open(_reactive_chain_file(app_dir), "w") do io
+        for n in names
+            println(io, n)
+        end
+    end
+    if index !== nothing && replaced != name
+        rm(joinpath(dirname(_reactive_sysimage(app_dir)), replaced); force = true)
+    end
+    return names
+function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim::Symbol = :off,
                             image::Symbol = :whole, delta_opt::Int = -1)
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
     config = data["config"]
@@ -266,9 +326,17 @@ _reactive_roots(statements) = unique!(filter(line -> !occursin(r"\bMain\.", line
         elapsed = @elapsed begin
             reply = _reactive_request(session["socket"], "save " * archive)
             startswith(reply, "ok") || error("materialize_app: the save answered `", reply, "`; see ", joinpath(store, "server.log"))
+            if image == :overlay
+                overlay = _reactive_overlay_link(app_dir, archive, id)
+            else
+                create_sysimg_from_object_file(vcat(_reactive_link_texts(store, snapshots, base), [archive]),
+                                               next_sysimage; version = nothing, compat_level = "major",
+                                               soname = basename(sysimage), gc_sections = true)
+            end
         end
     else
     ancestors = _reactive_link_texts(store, snapshots, base)
+    # The image write of the child: `pages` copies the clean pages of the
     # base it loads (Stage F); the founding above writes whole. The reuse,
     # the way of the write and the delta's level are flags of the child.
     elapsed = @elapsed begin
@@ -286,6 +354,8 @@ _reactive_roots(statements) = unique!(filter(line -> !occursin(r"\bMain\.", line
                             keep_object_archive = archive,
                             reactive_image = true,
                             soname = basename(sysimage),
+                            # An overlay build keeps the archive: it links below
+                            link = image != :overlay,
                             # The previous image carries the Main bindings of its
                             # own build; a new import would only warn. The child
                             # resolves modules through `Base.loaded_modules`.
@@ -306,6 +376,7 @@ _reactive_roots(statements) = unique!(filter(line -> !occursin(r"\bMain\.", line
                          for (file, root) in zip(files, roots)]
     entry = _reactive_entry(id)
     entry["base"] = base
+    image == :overlay && (entry["overlay"] = overlay)
     push!(data["snapshot"], entry)
     _reactive_save(store, data)
     return app_dir
@@ -487,6 +558,7 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
             max_rss_kb = parse(Int, get(ENV, "JULIA_REACTIVE_SERVER_RSS_KB", string(16 * 1024 * 1024)))
             same_image = get(session, "image", "whole") == string(image) &&
                          get(session, "delta_opt", -1) == delta_opt
+            if saves < max_saves && rss_kb < max_rss_kb && last == snapshots[end]["id"] && same_image
                 return session
             end
             _reactive_request(session["socket"], "quit"; quiet = true)
