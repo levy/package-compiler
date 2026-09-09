@@ -44,6 +44,7 @@ export create_sysimage, create_app, create_library
 include("juliaconfig.jl")
 include("../ext/TerminalSpinners.jl")
 include("library_selection.jl")
+include("reactive.jl")
 
 
 ##############
@@ -689,7 +690,8 @@ function create_sysimg_object_file(object_file::String,
                             sysimage_build_args::Cmd,
                             extra_precompiles::String,
                             incremental::Bool,
-                            import_into_main::Bool)
+                            import_into_main::Bool,
+                            reactive_image::Bool=false)
     julia_code_buffer = IOBuffer()
     # include all packages into the sysimg
     print(julia_code_buffer, """
@@ -750,12 +752,19 @@ function create_sysimg_object_file(object_file::String,
                     catch e
                         if e isa UndefVarError
                             dep = string(e.var)
-                            mods = filter(p -> p.first.name == dep, Base.loaded_modules)
-                            if length(mods) != 1
+                            # A loop, not a closure: a closure is a method, and a
+                            # method roots this module in the image of a rebuild.
+                            mod = nothing
+                            nmods = 0
+                            for (id, loaded) in Base.loaded_modules
+                                id.name == dep || continue
+                                mod = loaded
+                                nmods += 1
+                            end
+                            if nmods != 1
                                 @debug "zero or multiple modules loaded with name \$dep"
                                 @goto skip_precompile
                             else
-                                _, mod = only(mods)
                                 @debug "importing \$dep into PrecompileStagingArea"
                                 Base.eval(PrecompileStagingArea, :(\$(Symbol(dep)) = \$(mod)))
                             end
@@ -802,7 +811,12 @@ function create_sysimg_object_file(object_file::String,
         """)
     end
 
+    # A `--output-o` process runs no `__init__`, so nothing registers the
+    # exit hook that deletes the temporary files of the process. Delete them
+    # here, or the image keeps their paths in `Base.Filesystem.TEMP_CLEANUP`
+    # and a chain of rebuilds grows by two paths per rebuild.
     print(julia_code_buffer, """
+        Base.Filesystem.temp_cleanup_purge(force = true)
         empty!(Core.ARGS)
         empty!(Base.ARGS)
         empty!(LOAD_PATH)
@@ -838,7 +852,9 @@ function create_sysimg_object_file(object_file::String,
     # code that writes the object file: `src/aotcompile.cpp` of Julia never reads
     # `jl_options.nthreads`. `with_image_threads` sets the count that this code
     # does read, so the pin above stays and the object file still uses every CPU.
-    cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$cpu_target $sysimage_build_args
+    # The reactive image format (version 3, `src/reactive.jl`): the object file
+    # carries one function table in id order, and every function and every
+    # global slot sits in a section of its own, so that the link can drop the
         --sysimage=$base_sysimage --project=$project --output-o=$(object_file)
         --threads=1 $outputo_file`)
     @debug "running $cmd"
@@ -925,6 +941,16 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                          compat_level::String="major",
                          extra_precompiles::String = "",
                          import_into_main::Bool=true,
+                         # Reactive materialization (src/reactive.jl): keep a copy of the
+                         # object archive for the store, and link the text objects of the
+                         # earlier snapshots in front of the delta.
+                         keep_object_archive::Union{Nothing, String}=nothing,
+                         extra_object_files::Vector{String}=String[],
+                         # The reactive image format: one function table, one
+                         # section per function, and a link that drops the dead
+                         # sections. It holds one CPU target, and it needs the
+                         # reactive Julia to write it and to load it.
+                         reactive_image::Bool=false,
                          )
     # We call this at the very beginning to make sure that the user has a compiler available. Therefore, if no compiler
     # is found, we throw an error immediately, instead of making the user wait a while before the error is thrown.
@@ -936,6 +962,12 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
 
     if filter_stdlibs && incremental
         error("must use `incremental=false` to use `filter_stdlibs=true`")
+    end
+
+    if reactive_image
+        occursin(';', cpu_target) &&
+            error("`reactive_image=true` holds one CPU target; `cpu_target` names several: $cpu_target")
+        Sys.islinux() || error("`reactive_image=true` links with `--gc-sections`, which needs Linux")
     end
 
     if compress_sysimage
@@ -1003,7 +1035,9 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                                 sysimage_build_args,
                                 extra_precompiles,
                                 incremental,
-                                import_into_main)
+                                import_into_main,
+                                reactive_image)
+        keep_object_archive === nothing || cp(object_file, keep_object_archive; force=true)
         if julia_init_c_file !== nothing
             if julia_init_c_file isa String
                 julia_init_c_file = [julia_init_c_file]
@@ -1023,11 +1057,12 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                 end
             end
         end
-        create_sysimg_from_object_file(object_files,
+        # The extra objects go in front of the delta, and they are not deleted
                                     sysimage_path;
                                     compat_level,
                                     version,
-                                    soname)
+                                    soname,
+                                    gc_sections = reactive_image)
     finally
         foreach(object_files) do file
             rm(file; force=true)
@@ -1052,7 +1087,8 @@ function create_sysimg_from_object_file(object_files::Vector{String},
                                         sysimage_path::String;
                                         version,
                                         compat_level::String,
-                                        soname::Union{Nothing, String})
+                                        soname::Union{Nothing, String},
+                                        gc_sections::Bool=false)
 
     if soname === nothing && (Sys.isunix() && !Sys.isapple())
         soname = basename(sysimage_path)
@@ -1060,6 +1096,15 @@ function create_sysimg_from_object_file(object_files::Vector{String},
     mkpath(dirname(sysimage_path))
     # Prevent compiler from stripping all symbols from the shared lib.
     o_file_flags = Sys.isapple() ? `-Wl,-all_load $object_files` : `-Wl,--whole-archive $object_files -Wl,--no-whole-archive`
+    # The reactive image: every object is linked whole, and the linker then
+    # drops the sections that nothing reaches from an exported symbol. The
+    # function table of the image is the root of every live function.
+    gc_sections && (o_file_flags = `$o_file_flags -Wl,--gc-sections`)
+    # A reactive image links a data object of hundreds of megabytes on every
+    # rebuild: lld copies it in a fraction of the time of the default linker.
+    if gc_sections && Sys.islinux() && Sys.which("ld.lld") !== nothing && get(ENV, "JULIA_REACTIVE_LINKER", "lld") == "lld"
+        o_file_flags = `-fuse-ld=lld $o_file_flags`
+    end
     extra = get_extra_linker_flags(version, compat_level, soname)
     cmd = `$(bitflag()) $(march()) -shared -L$(julia_libdir()) -L$(julia_private_libdir()) -o $sysimage_path $o_file_flags $(Base.shell_split(ldlibs())) $extra`
     run_compiler(cmd; cplusplus=true)
@@ -1212,7 +1257,8 @@ function create_app(package_dir::String,
                     include_transitive_dependencies::Bool=true,
                     include_preferences::Bool=true,
                     script::Union{Nothing, String}=nothing,
-                    quiet::Bool=false)
+                    quiet::Bool=false,
+                    keep_object_archive::Union{Nothing, String}=nothing,
     if filter_stdlibs && incremental
         error("must use `incremental=false` to use `filter_stdlibs=true`")
     end
@@ -1290,7 +1336,9 @@ function create_app(package_dir::String,
                         compress_sysimage,
                         include_transitive_dependencies,
                         extra_precompiles = join(precompiles, "\n"),
-                        script)
+                        script,
+                        keep_object_archive,
+                        reactive_image)
     catch e
         sysimage_error = e
     end
