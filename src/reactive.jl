@@ -4,7 +4,7 @@
 #
 # The system is described in the `julia-reactive` checkout:
 # `contrib/reactive-compiler/doc/architecture.md` says what is built and why,
-# and `contrib/reactive-compiler/plan/pending/reactive-materialization.md`
+# and `contrib/reactive-compiler/plan/done/reactive-materialization.md`
 # holds the chronological record and the measurements.
 # The harness — the ledger, the classifier, the apply, the trace precompile,
 # the save and the server — is the stdlib `ReactiveCompiler` of that Julia,
