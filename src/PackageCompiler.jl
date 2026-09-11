@@ -12,6 +12,32 @@ using TOML
 using Glob
 using p7zip_jll: p7zip_path
 
+"""
+    @phase name expression
+
+Time one phase of a build and print what it cost, when `PACKAGECOMPILER_TIMING`
+is set. A build is several phases with very different costs, and a wall-clock
+total says nothing about which one to attack.
+
+**A phase that runs beside another one is not timed.** `create_app` copies the
+files of the app on a spawned task while the system image compiles, so timing
+each copy would report wall clock that the build never spent.
+"""
+macro phase(name, expression)
+    quote
+        if get(ENV, "PACKAGECOMPILER_TIMING", "0") == "0"
+            $(esc(expression))
+        else
+            local t0 = time()
+            local result = $(esc(expression))
+            println("PHASE ", $(esc(name)), " ", round(time() - t0; digits = 1), " s")
+            flush(stdout)
+            result
+        end
+    end
+end
+
+
 export create_sysimage, create_app, create_library
 
 include("juliaconfig.jl")
@@ -566,8 +592,21 @@ end
 
 function ensurecompiled(project, packages, sysimage)
     length(packages) == 0 && return
-    # TODO: Only precompile `packages` (should be available in Pkg 1.8)
-    cmd = `$(get_julia_cmd()) --sysimage=$sysimage -e 'using Pkg; Pkg.precompile()'`
+    # Load the packages, rather than asking Pkg to precompile them.
+    #
+    # The job here is to leave a cache that the sysimage build can read. That
+    # build runs under `--pkgimages=no`, so it needs the source-only cache, and
+    # `import` writes exactly that one — a package whose cache is missing or
+    # stale precompiles as it loads.
+    #
+    # `Pkg.precompile()` did the same job and cost 45 to 80 seconds of every
+    # build, on a project with no dependencies at all. Under `--pkgimages=no` its
+    # staleness scan rejects every pkgimage-backed cache in the depot, so what it
+    # costs follows the size of the depot rather than the size of the project:
+    # measured on one holding 15,324 files, 0.45 s with pkgimages against 45.6 s
+    # without, for a call that precompiled nothing and printed nothing.
+    imports = join(("import " * String(package) for package in packages), "\n")
+    cmd = `$(get_julia_cmd()) --sysimage=$sysimage -e $imports`
     splitter = Sys.iswindows() ? ';' : ':'
     @debug "ensurecompiled: running $cmd" JULIA_LOAD_PATH = "$project$(splitter)@stdlib"
     cmd = addenv(cmd, "JULIA_LOAD_PATH" => "$project$(splitter)@stdlib")
@@ -871,7 +910,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
     # Instantiate the project
 
     @debug "instantiating project at $(repr(project))"
-    Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
+    @phase "instantiate" Pkg.instantiate(ctx, verbose=true, allow_autoprecomp = false)
 
     if !incremental
         if base_sysimage !== nothing
@@ -882,7 +921,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
         base_sysimage = something(base_sysimage, unsafe_string(Base.JLOptions().image_file))
     end
 
-    ensurecompiled(project, packages, base_sysimage)
+    @phase "ensurecompiled" ensurecompiled(project, packages, base_sysimage)
 
     # Requested packages must always be loaded into the sysimage. The option only
     # controls whether their dependency graph is loaded explicitly as well.
@@ -1188,7 +1227,7 @@ function create_app(package_dir::String,
 
     sysimage_error = nothing
     try
-        create_sysimage([package_name]; sysimage_path, project,
+        @phase "create-sysimage" create_sysimage([package_name]; sysimage_path, project,
                         incremental,
                         filter_stdlibs,
                         precompile_execution_file,
