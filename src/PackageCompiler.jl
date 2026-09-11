@@ -850,6 +850,11 @@ compiler (can also include extra arguments to the compiler, like `-g`).
 - `compress_sysimage::Bool`: If `true`, compress the sysimage data at the expense
   of slightly increased load time. This is particularly useful on Windows where sysimages of
   2 GiB or more fail to load. Requires Julia v1.13 or later. Defaults to `false`.
+
+- `keep_object_archive::Union{Nothing, String}`: If a `String`, the object archive the
+  sysimage is linked from is written there and kept, so that a caller can link it into
+  something else — an executable that carries its own image, say. The name must end in
+  `-o.a` on macOS. Defaults to `nothing`, and then the archive is a temporary file.
 """
 function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}, Vector{Symbol}}=nothing;
                          sysimage_path::String,
@@ -863,6 +868,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                          sysimage_build_args::Cmd=``,
                          compress_sysimage::Bool=false,
                          include_transitive_dependencies::Bool=true,
+                         keep_object_archive::Union{Nothing, String}=nothing,
                          # Internal args
                          base_sysimage::Union{Nothing, String}=nothing,
                          julia_init_c_file=nothing,
@@ -933,14 +939,19 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
     end
 
     # Create the sysimage
-    object_file = tempname() * "-o.a"
     # This naming convention (`-o.a`) is necessary to make the sysimage
     # work on macOS.
     # Bug report: https://github.com/JuliaLang/PackageCompiler.jl/issues/738
     # PR: https://github.com/JuliaLang/PackageCompiler.jl/pull/930
+    if keep_object_archive === nothing
+        object_file = tempname() * "-o.a"
+    else
+        object_file = abspath(keep_object_archive)
+        mkpath(dirname(object_file))
+    end
     object_files = [object_file]
     try
-        create_sysimg_object_file(object_file, packages, packages_sysimg;
+        @phase "emit-object" create_sysimg_object_file(object_file, packages, packages_sysimg;
                                 project,
                                 base_sysimage,
                                 precompile_execution_file,
@@ -977,7 +988,7 @@ function create_sysimage(packages::Union{Nothing, String, Symbol, Vector{String}
                                     soname)
     finally
         foreach(object_files) do file
-            rm(file; force=true)
+            (keep_object_archive !== nothing && file == object_file) || rm(file; force=true)
         end
     end
 
@@ -1142,6 +1153,10 @@ compiler (can also include extra arguments to the compiler, like `-g`).
   2 GiB or more fail to load. Requires Julia v1.13 or later. Defaults to `false`.
 
 - `script::String`: Path to a file that gets executed in the `--output-o` process.
+
+- `keep_object_archive::Union{Nothing, String}`: If a `String`, keep the object archive the
+  sysimage is linked from at that path, for a caller that links its own executable — see
+  [`create_sysimage`](@ref). Defaults to `nothing`.
 """
 function create_app(package_dir::String,
                     app_dir::String;
@@ -1159,6 +1174,7 @@ function create_app(package_dir::String,
                     include_transitive_dependencies::Bool=true,
                     include_preferences::Bool=true,
                     script::Union{Nothing, String}=nothing,
+                    keep_object_archive::Union{Nothing, String}=nothing,
                     quiet::Bool=false)
     if filter_stdlibs && incremental
         error("must use `incremental=false` to use `filter_stdlibs=true`")
@@ -1237,7 +1253,8 @@ function create_app(package_dir::String,
                         compress_sysimage,
                         include_transitive_dependencies,
                         extra_precompiles = join(precompiles, "\n"),
-                        script)
+                        script,
+                        keep_object_archive)
     catch e
         sysimage_error = e
     end
